@@ -396,20 +396,20 @@ class MicrosampleDatabaseBuilder:
             except Exception:
                 pass
 
-        # Final fallback to path heuristic
+        # Final fallback unknown
         path_parts = file_path.parts
         if not artist:
-            if len(path_parts) >= 3:
-                artist = path_parts[-3]
-            elif len(path_parts) == 2:
-                artist = path_parts[-2]
-            else:
-                artist = "Unknown Artist"
+            # if len(path_parts) >= 3:
+            #     artist = path_parts[-3]
+            # elif len(path_parts) == 2:
+            #     artist = path_parts[-2]
+            # else:
+            artist = "Unknown Artist"
         if not album:
-            if len(path_parts) >= 2:
-                album = path_parts[-2]
-            else:
-                album = "Unknown Album"
+            # if len(path_parts) >= 2:
+            #     album = path_parts[-2]
+            # else:
+            album = "Unknown Album"
         if not song_title:
             song_title = file_path.stem
 

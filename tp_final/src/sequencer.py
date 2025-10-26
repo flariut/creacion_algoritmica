@@ -5,6 +5,7 @@ import random
 import threading
 import argparse
 import sqlite3
+import json
 from dataclasses import dataclass, field
 from typing import List, Dict
 import numpy as np
@@ -20,7 +21,7 @@ def parse_arguments():
     parser.add_argument('--samples-dir', default='samples', help='Directory containing sample files')
     parser.add_argument('--bpm', type=float, default=120, help='Tempo in BPM')
     parser.add_argument('--steps', type=int, default=16, help='Steps per pattern')
-    parser.add_argument('--channels', type=int, choices=[1, 2, 4], default=2, 
+    parser.add_argument('--channels', type=int, choices=[1, 2, 4], default=1, 
                        help='Output channels: 1=mono, 2=stereo, 4=quadraphonic')
     parser.add_argument('--sr', type=int, default=44100, help='Sample rate')
     parser.add_argument('--blocksize', type=int, default=2048, help='Audio block size')
@@ -29,7 +30,7 @@ def parse_arguments():
     # Sequence configuration
     parser.add_argument('--repeat-min', type=int, default=4, help='Minimum pattern repetitions')
     parser.add_argument('--repeat-max', type=int, default=16, help='Maximum pattern repetitions')
-    parser.add_argument('--samples-per-track', type=int, default=50, 
+    parser.add_argument('--samples-per-track', type=int, default=1000, 
                        help='Number of samples to fetch per track type')
     
     # Sample processing
@@ -166,7 +167,7 @@ class SampleDatabase:
                     data = np.asarray(data, dtype=np.float32)
                     
                     # Parse metadata
-                    metadata = eval(metadata_json) if metadata_json else {}
+                    metadata = json.loads(metadata_json) if metadata_json else {}
                     
                     sample = Sample(
                         data=data,
@@ -234,8 +235,8 @@ class Pattern:
                 index=i,
                 sample_idx=rng.randrange(max(1, sample_count)),
                 on=rng.choice([True, False]),
-                #prob=rng.uniform(0.4, 0.95),
-                prob=1,
+                prob=rng.uniform(0.1, 1),
+                #prob=1,
                 #semitone=rng.uniform(-12, 12),
                 semitone=0,
                 gain=rng.uniform(0.5, 1.0),
