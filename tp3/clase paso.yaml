@@ -1,0 +1,27 @@
+clase paso:
+    propiedades:
+        encendido
+        probabilidad
+        fade in, fade out (porcentajes)
+        hue
+        subdivisiones de paso
+        ruta imagen
+
+    métodos:
+        mostrar imagen ()
+
+clase secuenciador:
+    propiedades:
+        cantidad de pasos
+        bpm
+        carpeta de imagenes
+    
+    métodos:
+        aleatorizar pasos ()
+        ejecutar (cantidad de repeticiones)
+
+
+crear nuevo secuenciador
+inifinitamente:
+    aleatorizar pasos
+    ejecutar secuenciador (8 repeticiones)

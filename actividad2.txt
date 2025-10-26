@@ -1,0 +1,30 @@
+clase paso:
+    encendido?
+    volumen
+    nota
+    duracion
+    funcion ejecutar()
+
+array pasos[8]
+
+para cada paso:
+    paso.encendido = random(0, 1)
+    paso.volumen = random(50, 100)
+    paso.nota = random(60, 84)
+    paso.duracion = random(50, 100)
+
+# pasos por minuto
+clock = 120
+
+seq_encendido = 1
+
+para cada paso, mientras seq_encendido:
+    paso.ejecutar()
+    esperar_segundos(60 / clock)
+
+
+-----
+
+
+
+
