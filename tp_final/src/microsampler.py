@@ -201,37 +201,59 @@ class MicrosampleDatabaseBuilder:
             traceback.print_exc()
             return False
         
+    # def save_sample_to_disk(self, sample_data, sample_rate, sample_id):
+    #     """Save sample audio to disk"""
+    #     filename = f"{sample_id}.wav"
+    #     filepath = self.samples_output_dir / filename
+        
+    #     try:
+    #         # Ensure the data is in correct format for soundfile
+    #         if len(sample_data.shape) == 1:
+    #             # Mono audio
+    #             sample_data_to_save = sample_data
+    #         elif sample_data.shape[0] == 2 and sample_data.shape[1] > 2:
+    #             # Shape: (channels, samples) -> convert to (samples, channels)
+    #             sample_data_to_save = sample_data.T
+    #         else:
+    #             # Assume (samples, channels) or other format
+    #             sample_data_to_save = sample_data
+            
+    #         sf.write(filepath, sample_data_to_save, sample_rate)
+    #         return filename
+    #     except Exception as e:
+    #         print(f"Error saving sample {sample_id}: {e}")
+    #         # Fallback: try with mono conversion
+    #         try:
+    #             if len(sample_data.shape) > 1:
+    #                 sample_data = np.mean(sample_data, axis=0)
+    #             sf.write(filepath, sample_data, sample_rate)
+    #             return filename
+    #         except Exception as e2:
+    #             print(f"Fallback save also failed: {e2}")
+    #             return None
+
     def save_sample_to_disk(self, sample_data, sample_rate, sample_id):
-        """Save sample audio to disk"""
+        """Save sample audio to disk (always mono)"""
         filename = f"{sample_id}.wav"
         filepath = self.samples_output_dir / filename
         
         try:
-            # Ensure the data is in correct format for soundfile
-            if len(sample_data.shape) == 1:
-                # Mono audio
-                sample_data_to_save = sample_data
-            elif sample_data.shape[0] == 2 and sample_data.shape[1] > 2:
-                # Shape: (channels, samples) -> convert to (samples, channels)
-                sample_data_to_save = sample_data.T
-            else:
-                # Assume (samples, channels) or other format
-                sample_data_to_save = sample_data
-            
-            sf.write(filepath, sample_data_to_save, sample_rate)
+            # FORCE MONO
+            if sample_data.ndim > 1:
+                # (channels, samples) → average across channels
+                if sample_data.shape[0] < sample_data.shape[1]:
+                    sample_data = np.mean(sample_data, axis=0)
+                else:
+                    sample_data = np.mean(sample_data, axis=1)
+
+            # Now sample_data is guaranteed mono (1D)
+            sf.write(filepath, sample_data, sample_rate)
             return filename
+
         except Exception as e:
             print(f"Error saving sample {sample_id}: {e}")
-            # Fallback: try with mono conversion
-            try:
-                if len(sample_data.shape) > 1:
-                    sample_data = np.mean(sample_data, axis=0)
-                sf.write(filepath, sample_data, sample_rate)
-                return filename
-            except Exception as e2:
-                print(f"Fallback save also failed: {e2}")
-                return None
-    
+            return None
+
     def store_sample_in_database(self, sample_info, sample_filename):
         """Store sample metadata in SQLite database"""
         if sample_filename is None:
@@ -473,24 +495,28 @@ class MicrosampleDatabaseBuilder:
                 return 'unknown'
             
     def compute_rms(self, sample):
-        if sample.ndim > 1:  # multi-channel → mono
+        """Compute RMS of a sample (works for both mono and multi-channel, but expects 1D for mono)"""
+        if sample.ndim > 1:
+            # If somehow we get multi-channel here, convert to mono
             sample = np.mean(sample, axis=0) if sample.shape[0] < sample.shape[1] else np.mean(sample, axis=1)
         return np.sqrt(np.mean(sample**2))
     
     def extract_samples_from_stem(self, stem_audio, stem_type, sample_rate, metadata, file_hash):
         """
         Extract samples by scanning the entire stem for segments that meet the RMS requirement,
-        then selecting sample regions and aligning to zero crossings. Works with mono or stereo.
+        then selecting sample regions and aligning to zero crossings. All processing in mono.
         """
-
-        # Convert to mono for RMS + zero-crossing analysis (but keep original for final output)
-        if stem_audio.ndim == 1:
-            mono = stem_audio
+        # Convert to mono immediately and ensure consistent format
+        if stem_audio.ndim > 1:
+            # Convert to proper mono - handle both (samples, channels) and (channels, samples)
+            if stem_audio.shape[0] < stem_audio.shape[1]:  # (channels, samples)
+                mono_audio = np.mean(stem_audio, axis=0)
+            else:  # (samples, channels)
+                mono_audio = np.mean(stem_audio, axis=1)
         else:
-            # Determine correct averaging direction
-            mono = np.mean(stem_audio, axis=0) if stem_audio.shape[0] < stem_audio.shape[1] else np.mean(stem_audio, axis=1)
+            mono_audio = stem_audio.copy()
 
-        total_samples = mono.shape[-1]
+        total_samples = len(mono_audio)
         sample_length = int(self.sample_duration * sample_rate)
 
         if total_samples < sample_length:
@@ -498,19 +524,18 @@ class MicrosampleDatabaseBuilder:
             return []
 
         # --- SCAN THE ENTIRE AUDIO FOR LOUD ENOUGH CANDIDATES ---
-        rms_window = sample_length  # same length as sample duration
-        hop = int(sample_length / 3)  # overlapping windows for more candidates
+        rms_window = sample_length
+        hop = int(sample_length / 3)
 
         candidates = []
         idx = 0
 
         while idx + sample_length < total_samples:
-            segment = mono[idx:idx + sample_length]
+            segment = mono_audio[idx:idx + sample_length]
             rms = self.compute_rms(segment)
 
             if rms >= self.min_rms:
                 candidates.append(idx)
-
             idx += hop
 
         if not candidates:
@@ -520,24 +545,17 @@ class MicrosampleDatabaseBuilder:
         # Limit to required count
         np.random.shuffle(candidates)
         selected_starts = candidates[:self.samples_per_stem]
-
         samples = []
 
         for seq, start in enumerate(selected_starts):
-            # Zero-crossing alignment
-            aligned_start = self.find_best_zero_crossing_around(mono, start, sample_rate)
+            # Zero-crossing alignment on mono audio
+            aligned_start = self.find_best_zero_crossing_around(mono_audio, start, sample_rate, window_duration=0.05)
 
             # Ensure bounds
             aligned_start = max(0, min(aligned_start, total_samples - sample_length))
 
-            # Extract waveform (preserve channel structure)
-            if stem_audio.ndim == 1:
-                sample_data = stem_audio[aligned_start:aligned_start + sample_length]
-            else:
-                if stem_audio.shape[0] < stem_audio.shape[1]:  # (channels, samples)
-                    sample_data = stem_audio[:, aligned_start:aligned_start + sample_length]
-                else:  # (samples, channels)
-                    sample_data = stem_audio[aligned_start:aligned_start + sample_length, :]
+            # Extract from mono audio for consistent processing
+            sample_data = mono_audio[aligned_start:aligned_start + sample_length]
 
             actual_position = aligned_start / sample_rate
 
@@ -545,57 +563,74 @@ class MicrosampleDatabaseBuilder:
                 'stem_type': stem_type,
                 'position': actual_position,
                 'duration': self.sample_duration,
-                'data': sample_data,
+                'data': sample_data,  # This is now guaranteed mono
                 'metadata': metadata.copy(),
                 'file_hash': file_hash,
                 'sequence': seq,
                 'sample_rate': sample_rate,
-                'rms': float(self.compute_rms(mono[aligned_start:aligned_start+sample_length])),
+                'rms': float(self.compute_rms(mono_audio[aligned_start:aligned_start+sample_length])),
             })
 
         print(f"Extracted {len(samples)} loud-enough samples from {stem_type} stem")
         return samples
 
-    def find_zero_crossings(self, audio_data, threshold=0.01):
-        """Find zero-crossing points in audio data"""
-        # Convert to mono if stereo
-        if len(audio_data.shape) > 1:
-            audio_data = np.mean(audio_data, axis=1)
+    def find_zero_crossings(self, audio_mono, threshold=0.01):
+        """
+        Find meaningful zero-crossings in mono audio signal.
         
+        Args:
+            audio_mono: 1D numpy array of mono audio
+            threshold: minimum amplitude to consider (to avoid noise)
+        
+        Returns:
+            Array of indices where zero-crossings occur
+        """
         # Remove DC offset
-        audio_data = audio_data - np.mean(audio_data)
+        audio_mono = audio_mono - np.mean(audio_mono)
         
-        # Find zero crossings where the signal changes sign
-        zero_crossings = np.where(np.diff(np.sign(audio_data)))[0]
-        
-        # Filter by amplitude to avoid noise around zero
-        if len(zero_crossings) > 0:
-            magnitudes = np.abs(audio_data[zero_crossings])
-            zero_crossings = zero_crossings[magnitudes > threshold]
-        
-        return zero_crossings
-    
-    def find_best_zero_crossing_around(self, audio_data, target_sample, sample_rate, window_duration=0.1):
-        """Find the best zero-crossing point around target position"""
-        window_samples = int(sample_rate * window_duration)
-        start_search = max(0, target_sample - window_samples // 2)
-        end_search = min(len(audio_data), target_sample + window_samples // 2)
-        
-        search_segment = audio_data[start_search:end_search]
-        
-        if len(search_segment) == 0:
-            return target_sample
-            
-        zero_crossings = self.find_zero_crossings(search_segment)
+        # Detect sign changes
+        sign = np.sign(audio_mono)
+        zero_crossings = np.where(np.diff(sign))[0]
         
         if len(zero_crossings) == 0:
-            return target_sample
-            
-        # Find closest zero crossing to target
-        local_target = target_sample - start_search
-        closest_idx = np.argmin(np.abs(zero_crossings - local_target))
+            return zero_crossings
         
-        return start_search + zero_crossings[closest_idx]
+        # Filter crossings where amplitude is too low (avoid noise/null-zone)
+        # Use the magnitude at the crossing point
+        magnitudes = np.abs(audio_mono[zero_crossings])
+        keep = magnitudes > threshold
+        
+        return zero_crossings[keep]
+
+    def find_best_zero_crossing_around(self, audio_mono, target_sample, sample_rate, window_duration=0.05):
+        """
+        Find a zero-crossing close to target_sample in mono audio.
+        
+        Args:
+            audio_mono: 1D numpy array of mono audio
+            target_sample: the target sample index to align
+            sample_rate: sample rate of the audio
+            window_duration: search window in seconds
+        
+        Returns:
+            Sample index aligned to the best zero-crossing
+        """
+        window = int(window_duration * sample_rate)
+        
+        start = max(0, target_sample - window)
+        end = min(len(audio_mono), target_sample + window)
+        
+        segment = audio_mono[start:end]
+        
+        zero_crossings = self.find_zero_crossings(segment)
+        
+        if len(zero_crossings) == 0:
+            return target_sample  # fallback
+        
+        # Find zero-crossing nearest to the original target position (relative to segment start)
+        local_target = target_sample - start
+        idx = np.argmin(np.abs(zero_crossings - local_target))
+        return start + zero_crossings[idx]
 
     def cleanup(self):
         """Clean up temporary files"""

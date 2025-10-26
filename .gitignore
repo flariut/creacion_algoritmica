@@ -3,4 +3,5 @@ LCA/
 tp_final/tpfinal3.9/
 tp_final/samples/
 tp_final/microsamplervenv
-tp_final/microsampler.db
+tp_final/microsamples.db
+tp_final/sequencervenv/
