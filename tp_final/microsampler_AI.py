@@ -25,6 +25,8 @@ class MicrosampleDatabaseBuilder:
         # Create directories
         self.samples_output_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+
+        self.separator = Separator()
         
         # Initialize database
         self.init_database()
