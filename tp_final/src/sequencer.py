@@ -240,7 +240,7 @@ class Pattern:
                 #prob=1,
                 #semitone=rng.uniform(-12, 12),
                 semitone=0,
-                gain=rng.uniform(0.5 / pattern_intensity, 1.0 / pattern_intensity),
+                gain=rng.uniform(0.1 * pattern_intensity, 0.2 * pattern_intensity),
                 #lowpass=rng.uniform(1000.0, 12000.0)
                 lowpass=20000.0
             ))
@@ -307,7 +307,7 @@ class SampleAccurateSequencer:
         
         initial_density = random.choice(self.pattern_densities)
         print(f"Initial density: {initial_density}")
-        initial_intensity = random.uniform(1.0, 3.0)
+        initial_intensity = random.uniform(1.0, 5.0)
         print(f"Initial intensity: {initial_intensity}")
 
         stem_types = ['drums', 'bass', 'other', 'vocals']
@@ -457,7 +457,7 @@ class SampleAccurateSequencer:
         """Regenerate patterns for all tracks"""
         density = random.choice(self.pattern_densities)
         print(f"New density: {density}")
-        intensity = random.uniform(1.0, 3.0)
+        intensity = random.uniform(1.0, 5.0)
         print(f"New intensity: {intensity}")
         for track in self.tracks:
             track.pattern = Pattern.random(self.steps, max(1, len(track.samples)), rng=track.rng, pattern_density=density, pattern_intensity=intensity)
