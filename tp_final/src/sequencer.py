@@ -227,19 +227,20 @@ class Pattern:
     steps: List[Step] = field(default_factory=list)
 
     @classmethod
-    def random(cls, steps=16, sample_count=1, rng: random.Random = None):
+    def random(cls, steps=16, sample_count=1, rng: random.Random = None, pattern_density=[True, False], pattern_intensity=1.0):
         rng = rng or random
         p = cls()
         for i in range(steps):
             p.steps.append(Step(
                 index=i,
                 sample_idx=rng.randrange(max(1, sample_count)),
-                on=rng.choice([True, False]),
+                #on=rng.choice([True, False, False, False, False, False, False, False]),
+                on=rng.choice(pattern_density),
                 prob=rng.uniform(0.1, 1),
                 #prob=1,
                 #semitone=rng.uniform(-12, 12),
                 semitone=0,
-                gain=rng.uniform(0.5, 1.0),
+                gain=rng.uniform(0.5 / pattern_intensity, 1.0 / pattern_intensity),
                 #lowpass=rng.uniform(1000.0, 12000.0)
                 lowpass=20000.0
             ))
@@ -295,12 +296,25 @@ class SampleAccurateSequencer:
         # build tracks with patterns and per-track RNG
         self.tracks: List[Track] = []
         global_rng = random.Random()
+
+        self.pattern_densities = [
+            [True],
+            [True, False],
+            [True, False, False, False],
+            [True, False, False, False, False, False, False, False],
+            [True, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False],
+        ]
         
+        initial_density = random.choice(self.pattern_densities)
+        print(f"Initial density: {initial_density}")
+        initial_intensity = random.uniform(1.0, 3.0)
+        print(f"Initial intensity: {initial_intensity}")
+
         stem_types = ['drums', 'bass', 'other', 'vocals']
         for i, stem_type in enumerate(stem_types):
             samples = samples_by_type.get(stem_type, [])
             track_rng = random.Random(global_rng.randint(0, 2**30))
-            pat = Pattern.random(self.steps, max(1, len(samples)), rng=track_rng)
+            pat = Pattern.random(self.steps, max(1, len(samples)), rng=track_rng, pattern_density=initial_density, pattern_intensity=initial_intensity)
             
             track = Track(
                 id=i,
@@ -441,8 +455,12 @@ class SampleAccurateSequencer:
 
     def _regenerate_patterns(self):
         """Regenerate patterns for all tracks"""
+        density = random.choice(self.pattern_densities)
+        print(f"New density: {density}")
+        intensity = random.uniform(1.0, 3.0)
+        print(f"New intensity: {intensity}")
         for track in self.tracks:
-            track.pattern = Pattern.random(self.steps, max(1, len(track.samples)), rng=track.rng)
+            track.pattern = Pattern.random(self.steps, max(1, len(track.samples)), rng=track.rng, pattern_density=density, pattern_intensity=intensity)
         
         self.loop_target = random.randint(self.config.repeat_min, self.config.repeat_max)
         print(f"[Regenerated patterns. Next repeat: {self.loop_target}]")
