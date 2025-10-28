@@ -11,6 +11,7 @@ from typing import List, Dict
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
+from collections import deque
 
 # ---------------- Configuration via Arguments ----------------
 def parse_arguments():
@@ -24,7 +25,7 @@ def parse_arguments():
     parser.add_argument('--channels', type=int, choices=[1, 2, 4], default=1, 
                        help='Output channels: 1=mono, 2=stereo, 4=quadraphonic')
     parser.add_argument('--sr', type=int, default=44100, help='Sample rate')
-    parser.add_argument('--blocksize', type=int, default=2048, help='Audio block size')
+    parser.add_argument('--blocksize', type=int, default=4096, help='Audio block size')
     parser.add_argument('--latency', default='high', help='Audio latency setting')
     
     # Sequence configuration
@@ -33,10 +34,31 @@ def parse_arguments():
     parser.add_argument('--samples-per-track', type=int, default=1000, 
                        help='Number of samples to fetch per track type')
     
-    # Sample processing
+    # Sample processing / fades
     parser.add_argument('--fade-duration', type=float, default=0.005, 
                        help='Fade in/out duration in seconds (default: 5ms)')
     
+    # Envelope (ADSR) in seconds
+    parser.add_argument('--env-attack', type=float, default=0.001, help='Envelope attack (s)')
+    parser.add_argument('--env-decay', type=float, default=1, help='Envelope decay (s)')
+    parser.add_argument('--env-sustain', type=float, default=1, help='Envelope sustain level (0..1)')
+    parser.add_argument('--env-release', type=float, default=1, help='Envelope release (s)')
+    
+    # Reverse play probability per step
+    parser.add_argument('--reverse-prob', type=float, default=0.2, help='Per-step probability to play sample reversed')
+    
+    # Stack options
+    parser.add_argument('--stack', action='store_true', help='Enable played-samples stack mode')
+    parser.add_argument('--stack-prob', type=float, default=0.8, help='When stack enabled, probability to pick sample from stack for a step')
+    parser.add_argument('--stack-max', type=int, default=64, help='Maximum size of the played-samples stack')
+    
+    # Soft clipping
+    parser.add_argument('--clip-drive', type=float, default=1.0, help='Soft-clip drive (higher = harder saturation)')
+    parser.add_argument('--clip-asym', type=float, default=0.3, help='Asymmetry -1.0..1.0 where positive biases positive side (tube-like)')
+    parser.add_argument('--clip-makeup', type=float, default=1.5, help='Makeup gain applied prior to soft clip')
+
+    parser.add_argument('--seed', type=int, default=None,help='Random seed for reproducibility (default: random)')
+
     return parser.parse_args()
 
 # ---------------- Channel Mapping ----------------
@@ -122,6 +144,74 @@ def lowpass_4pole(signal: np.ndarray, cutoff: float, sr: int) -> np.ndarray:
         y3 += alpha * (y2 - y3)
         y4 += alpha * (y3 - y4)
         out[i] = y4
+    return out
+
+def apply_adsr_envelope(signal: np.ndarray, sr: int, attack: float, decay: float, sustain: float, release: float) -> np.ndarray:
+    """Apply an ADSR envelope over the length of the signal.
+       Envelope times are in seconds. Release is tacked on to the end if short,
+       but to avoid length changes we place release within the sample tail if necessary.
+    """
+    length = signal.shape[0]
+    # convert to samples
+    a = max(0, int(round(attack * sr)))
+    d = max(0, int(round(decay * sr)))
+    r = max(0, int(round(release * sr)))
+    # sustain region length = remainder
+    sustain_len = max(0, length - (a + d + r))
+    # if signal too short, scale segments proportionally
+    if length < (a + d + r) and length > 0:
+        total = a + d + r
+        if total > 0:
+            scale = length / total
+            a = max(0, int(round(a * scale)))
+            d = max(0, int(round(d * scale)))
+            r = max(0, length - (a + d))
+            sustain_len = 0
+
+    env = np.ones(length, dtype=np.float32) * sustain
+    pos = 0
+    if a > 0:
+        env[pos:pos+a] = np.linspace(0.0, 1.0, a, dtype=np.float32)
+    pos += a
+    if d > 0:
+        env[pos:pos+d] = np.linspace(1.0, sustain, d, dtype=np.float32)
+    pos += d
+    # sustain region already set to sustain
+    pos += sustain_len
+    if r > 0:
+        # release falling from sustain to 0
+        env[pos:pos+r] = np.linspace(sustain, 0.0, r, dtype=np.float32)
+    return signal * env
+
+def soft_clip_channel(x: np.ndarray, drive: float = 1.0, asym: float = 0.0) -> np.ndarray:
+    """Soft clip a 1D signal vector.
+       drive: pre-saturation gain.
+       asym: -1..1 where positive amplifies positive half-wave relative to negative (tube-like).
+    """
+    # apply pre-drive
+    y = x * drive
+
+    # asymmetry - implement different scaling for pos/neg before tanh
+    # map asym from -1..1 to pos_scale and neg_scale multipliers
+    # keep overall energy normalized: pos_scale + neg_scale ~ 2
+    pos_scale = 1.0 + max(0.0, asym)
+    neg_scale = 1.0 + max(0.0, -asym)
+
+    # process halves
+    pos = np.tanh(pos_scale * np.maximum(0.0, y))
+    neg = np.tanh(neg_scale * np.minimum(0.0, y))
+    return pos + neg
+
+def apply_soft_clip(out: np.ndarray, drive: float, asym: float, makeup: float):
+    """Apply per-channel soft clipping with optional makeup gain."""
+    # apply makeup gain first (simple)
+    if makeup != 1.0:
+        out *= makeup
+    # process each channel separately
+    for ch in range(out.shape[1]):
+        out[:, ch] = soft_clip_channel(out[:, ch], drive, asym)
+    # final safety clamp to avoid NaNs/outliers
+    np.clip(out, -1.0, 1.0, out)
     return out
 
 # ---------------- Sample Database Loader -----------------
@@ -275,6 +365,27 @@ class SampleAccurateSequencer:
         self.latency = config.latency
         self.fade_samples = int(config.fade_duration * config.sr)
 
+        # envelope params
+        self.env_attack = config.env_attack
+        self.env_decay = config.env_decay
+        self.env_sustain = config.env_sustain
+        self.env_release = config.env_release
+
+        # soft clip params
+        self.clip_drive = config.clip_drive
+        self.clip_asym = config.clip_asym
+        self.clip_makeup = config.clip_makeup
+
+        # stack params
+        self.stack_enabled = bool(config.stack)
+        self.stack_prob = config.stack_prob
+        self.stack_max = max(1, config.stack_max)
+        self.played_stack = deque(maxlen=self.stack_max)
+        self.stack_lock = threading.Lock()
+
+        # reverse prob
+        self.reverse_prob = max(0.0, min(1.0, config.reverse_prob))
+
         # Get channel mapping
         self.channel_map = get_channel_mapping(self.channels_out)
 
@@ -397,8 +508,8 @@ class SampleAccurateSequencer:
         with self.lock:
             self.active_events = [ev for ev in self.active_events if ev.pos < ev.buffer.shape[0]]
 
-        # clip and output
-        np.clip(out, -1.0, 1.0, out)
+        # soft clip and output (per-channel)
+        apply_soft_clip(out, self.clip_drive, self.clip_asym, self.clip_makeup)
         outdata[:] = out
 
     def _mix_active_into(self, out: np.ndarray, start: int, end: int):
@@ -410,7 +521,9 @@ class SampleAccurateSequencer:
                 if remaining <= 0:
                     continue
                 n = min(length, remaining)
-                out[start:start + n, ev.channel] += ev.buffer[ev.pos:ev.pos + n]
+                # bounds safety for channel index
+                if ev.channel < out.shape[1]:
+                    out[start:start + n, ev.channel] += ev.buffer[ev.pos:ev.pos + n]
                 ev.pos += n
 
     def _trigger_step(self, step_index: int):
@@ -418,15 +531,29 @@ class SampleAccurateSequencer:
         for track in self.tracks:
             step = track.pattern.steps[step_index]
             if step.maybe_trigger(track.rng) and track.samples:
-                # Get sample
-                samp = track.samples[step.sample_idx % len(track.samples)]
-                
+                # Decide whether to pick from stack (if enabled)
+                use_stack_choice = False
+                chosen_sample = None
+                if self.stack_enabled and (track.rng.random() < self.stack_prob):
+                    with self.stack_lock:
+                        if len(self.played_stack) > 0:
+                            use_stack_choice = True
+                            chosen_sample = random.choice(list(self.played_stack))
+                            print("Using stack")
+                if not use_stack_choice:
+                    samp = track.samples[step.sample_idx % len(track.samples)]
+                    chosen_sample = samp
+
                 # Process sample
-                sig = samp.data
-                
+                sig = chosen_sample.data.copy()
+
+                # chance to reverse
+                if track.rng.random() < self.reverse_prob:
+                    sig = sig[::-1]
+
                 # Resample if needed
-                if samp.sr != self.sr:
-                    res_ratio = samp.sr / self.sr
+                if chosen_sample.sr != self.sr:
+                    res_ratio = chosen_sample.sr / self.sr
                     sig = resample_linear(sig, res_ratio)
                 
                 # Apply pitch shift
@@ -444,7 +571,10 @@ class SampleAccurateSequencer:
                 if sig.ndim > 1:
                     sig = np.mean(sig, axis=1)
                 
-                # Apply fade in/out to prevent clicks
+                # Apply ADSR envelope
+                sig = apply_adsr_envelope(sig, self.sr, self.env_attack, self.env_decay, self.env_sustain, self.env_release)
+                
+                # Apply fade in/out to prevent clicks (keeps your original protection)
                 sig = apply_fade(sig, self.fade_samples, self.sr)
                 
                 # Create play event
@@ -452,6 +582,12 @@ class SampleAccurateSequencer:
                     self.active_events.append(
                         PlayEvent(np.asarray(sig, dtype=np.float32), track.channel)
                     )
+
+                # push into stack (regardless of whether it was chosen from stack: remember last-played)
+                if self.stack_enabled:
+                    with self.stack_lock:
+                        # store reference to Sample object (lightweight)
+                        self.played_stack.append(chosen_sample)
 
     def _regenerate_patterns(self):
         """Regenerate patterns for all tracks"""
