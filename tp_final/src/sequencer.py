@@ -49,14 +49,15 @@ def parse_arguments():
     
     # Stack options
     parser.add_argument('--stack', action='store_true', help='Enable played-samples stack mode')
-    parser.add_argument('--stack-prob', type=float, default=0.8, help='When stack enabled, probability to pick sample from stack for a step')
+    parser.add_argument('--stack-prob', type=float, default=0.05, help='When stack enabled, probability to pick sample from stack for a step')
     parser.add_argument('--stack-max', type=int, default=64, help='Maximum size of the played-samples stack')
     
     # Soft clipping
     parser.add_argument('--clip-drive', type=float, default=1.0, help='Soft-clip drive (higher = harder saturation)')
-    parser.add_argument('--clip-asym', type=float, default=0.3, help='Asymmetry -1.0..1.0 where positive biases positive side (tube-like)')
-    parser.add_argument('--clip-makeup', type=float, default=1.5, help='Makeup gain applied prior to soft clip')
+    parser.add_argument('--clip-asym', type=float, default=-0.3, help='Asymmetry -1.0..1.0 where positive biases positive side (tube-like)')
+    parser.add_argument('--clip-makeup', type=float, default=3, help='Makeup gain applied prior to soft clip')
 
+    # Random control
     parser.add_argument('--seed', type=int, default=None,help='Random seed for reproducibility (default: random)')
 
     return parser.parse_args()
@@ -225,44 +226,49 @@ class Sample:
     rms: float
 
 class SampleDatabase:
-    def __init__(self, db_path: str, samples_dir: str):
+    def __init__(self, db_path: str, samples_dir: str, rng: random.Random):
         self.db_path = db_path
         self.samples_dir = samples_dir
         self.conn = sqlite3.connect(db_path)
-        
+        self.rng = rng  # deterministic RNG passed from main
+    
     def get_samples_by_stem_type(self, stem_type: str, limit: int = 100) -> List[Sample]:
-        """Fetch samples of specific stem type from database"""
+        """Fetch samples of a given stem type with deterministic ordering."""
         cursor = self.conn.cursor()
         
+        # Deterministic ordering — DO NOT use RANDOM().
         query = """
-        SELECT sample_filename, stem_type, sample_position, duration, metadata_json
-        FROM samples 
-        WHERE stem_type = ?
-        ORDER BY RANDOM()
-        LIMIT ?
+            SELECT sample_filename, stem_type, sample_position, duration, metadata_json
+            FROM samples
+            WHERE stem_type = ?
+            ORDER BY sample_filename ASC
         """
         
-        cursor.execute(query, (stem_type, limit))
+        cursor.execute(query, (stem_type,))
         rows = cursor.fetchall()
-        
+
+        # Deterministic shuffle (instead of SQLite RANDOM)
+        self.rng.shuffle(rows)
+        if limit is not None:
+            rows = rows[:limit]
+
         samples = []
         for row in rows:
             filename, stem_type, position, duration, metadata_json = row
             
-            # Load audio file from samples directory
             try:
                 audio_path = os.path.join(self.samples_dir, filename)
                 if os.path.exists(audio_path):
                     data, sr = sf.read(audio_path, always_2d=False)
                     data = np.asarray(data, dtype=np.float32)
                     
-                    # Parse metadata
                     metadata = json.loads(metadata_json) if metadata_json else {}
                     
                     sample = Sample(
                         data=data,
-                        sr=sr,  # Get sample rate from the audio file itself
-                        name=f"{metadata.get('artist', 'Unknown')} - {stem_type}",
+                        sr=sr,
+                        name=f"{metadata.get('artist', 'Unknown')} - "
+                             f"{metadata.get('song_title', 'Unknown')} - {stem_type}",
                         stem_type=stem_type,
                         original_position=position,
                         rms=metadata.get('rms', 0.5)
@@ -270,7 +276,6 @@ class SampleDatabase:
                     samples.append(sample)
                 else:
                     print(f"Warning: Sample file not found: {audio_path}")
-                    
             except Exception as e:
                 print(f"Error loading sample {filename}: {e}")
                 continue
@@ -281,9 +286,9 @@ class SampleDatabase:
     def close(self):
         self.conn.close()
 
-def load_samples_from_db(db_path: str, samples_dir: str, samples_per_track: int) -> Dict[str, List[Sample]]:
+def load_samples_from_db(db_path: str, samples_dir: str, samples_per_track: int, rng: random.Random) -> Dict[str, List[Sample]]:
     """Load samples for each stem type from database"""
-    db = SampleDatabase(db_path, samples_dir)
+    db = SampleDatabase(db_path, samples_dir, rng)
     
     stem_types = ['drums', 'bass', 'other', 'vocals']
     samples_by_type = {}
@@ -317,21 +322,19 @@ class Pattern:
     steps: List[Step] = field(default_factory=list)
 
     @classmethod
-    def random(cls, steps=16, sample_count=1, rng: random.Random = None, pattern_density=[True, False], pattern_intensity=1.0):
+    def random(cls, steps=16, sample_count=1, rng: random.Random = None, pattern_density=0.5, pattern_intensity=1.0):
         rng = rng or random
         p = cls()
         for i in range(steps):
             p.steps.append(Step(
                 index=i,
                 sample_idx=rng.randrange(max(1, sample_count)),
-                #on=rng.choice([True, False, False, False, False, False, False, False]),
-                on=rng.choice(pattern_density),
+                on=rng.random() < pattern_density,
                 prob=rng.uniform(0.1, 1),
-                #prob=1,
                 #semitone=rng.uniform(-12, 12),
                 semitone=0,
                 gain=rng.uniform(0.1 * pattern_intensity, 0.2 * pattern_intensity),
-                #lowpass=rng.uniform(1000.0, 12000.0)
+                #lowpass=rng.uniform(1000.0, 20000.0)
                 lowpass=20000.0
             ))
         return p
@@ -344,6 +347,8 @@ class Track:
     samples: List[Sample]
     pattern: Pattern
     rng: random.Random
+    played_stack: deque = field(default_factory=lambda: deque(maxlen=64))
+    stack_lock: threading.Lock = field(default_factory=threading.Lock)
 
 @dataclass
 class PlayEvent:
@@ -353,9 +358,12 @@ class PlayEvent:
 
 # ---------------- Audio engine with callback ----------------
 class SampleAccurateSequencer:
-    def __init__(self, samples_by_type: Dict[str, List[Sample]], config):
+    def __init__(self, samples_by_type: Dict[str, List[Sample]], config, rng: random.Random):
         self.samples_by_type = samples_by_type
         self.config = config
+
+        # Sample global rng
+        self.global_rng = rng
         
         self.bpm = config.bpm
         self.steps = config.steps
@@ -380,8 +388,6 @@ class SampleAccurateSequencer:
         self.stack_enabled = bool(config.stack)
         self.stack_prob = config.stack_prob
         self.stack_max = max(1, config.stack_max)
-        self.played_stack = deque(maxlen=self.stack_max)
-        self.stack_lock = threading.Lock()
 
         # reverse prob
         self.reverse_prob = max(0.0, min(1.0, config.reverse_prob))
@@ -398,7 +404,7 @@ class SampleAccurateSequencer:
         self.next_step_sample = self.step_length
         self.step_index = 0
         self.loop_count = 0
-        self.loop_target = random.randint(config.repeat_min, config.repeat_max)
+        self.loop_target = self.global_rng.randint(config.repeat_min, config.repeat_max)
 
         # active sounds
         self.active_events: List[PlayEvent] = []
@@ -406,25 +412,16 @@ class SampleAccurateSequencer:
 
         # build tracks with patterns and per-track RNG
         self.tracks: List[Track] = []
-        global_rng = random.Random()
-
-        self.pattern_densities = [
-            [True],
-            [True, False],
-            [True, False, False, False],
-            [True, False, False, False, False, False, False, False],
-            [True, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False],
-        ]
         
-        initial_density = random.choice(self.pattern_densities)
-        print(f"Initial density: {initial_density}")
-        initial_intensity = random.uniform(1.0, 5.0)
-        print(f"Initial intensity: {initial_intensity}")
+        initial_density = self.global_rng.random()
+        print(f"Initial density: {initial_density:.2f}")
+        initial_intensity = self.global_rng.uniform(1.0, 5.0)
+        print(f"Initial intensity: {initial_intensity:.2f}")
 
         stem_types = ['drums', 'bass', 'other', 'vocals']
         for i, stem_type in enumerate(stem_types):
             samples = samples_by_type.get(stem_type, [])
-            track_rng = random.Random(global_rng.randint(0, 2**30))
+            track_rng = random.Random(self.global_rng.randint(0, 2**30))
             pat = Pattern.random(self.steps, max(1, len(samples)), rng=track_rng, pattern_density=initial_density, pattern_intensity=initial_intensity)
             
             track = Track(
@@ -435,6 +432,7 @@ class SampleAccurateSequencer:
                 pattern=pat,
                 rng=track_rng
             )
+            track.played_stack = deque(maxlen=self.stack_max)
             self.tracks.append(track)
             print(f"Track {i}: {stem_type} -> channel {track.channel}, {len(samples)} samples")
 
@@ -535,14 +533,15 @@ class SampleAccurateSequencer:
                 use_stack_choice = False
                 chosen_sample = None
                 if self.stack_enabled and (track.rng.random() < self.stack_prob):
-                    with self.stack_lock:
-                        if len(self.played_stack) > 0:
+                    with track.stack_lock:
+                        if len(track.played_stack) > 0:
+                            chosen_sample = track.played_stack.pop()
                             use_stack_choice = True
-                            chosen_sample = random.choice(list(self.played_stack))
-                            print("Using stack")
+                            print(f"using stack {chosen_sample.name} in track {track.id}")
                 if not use_stack_choice:
                     samp = track.samples[step.sample_idx % len(track.samples)]
                     chosen_sample = samp
+                    print(f"playing {chosen_sample.name} in track {track.id}")
 
                 # Process sample
                 sig = chosen_sample.data.copy()
@@ -583,22 +582,23 @@ class SampleAccurateSequencer:
                         PlayEvent(np.asarray(sig, dtype=np.float32), track.channel)
                     )
 
-                # push into stack (regardless of whether it was chosen from stack: remember last-played)
-                if self.stack_enabled:
-                    with self.stack_lock:
-                        # store reference to Sample object (lightweight)
-                        self.played_stack.append(chosen_sample)
+                # push into stack
+                if self.stack_enabled and not use_stack_choice:
+                    with track.stack_lock:
+                        if all(chosen_sample is not s for s in track.played_stack):
+                            track.played_stack.append(chosen_sample)
+                            print(f"storing {chosen_sample.name} in stack for track {track.id}")
 
     def _regenerate_patterns(self):
         """Regenerate patterns for all tracks"""
-        density = random.choice(self.pattern_densities)
-        print(f"New density: {density}")
-        intensity = random.uniform(1.0, 5.0)
-        print(f"New intensity: {intensity}")
+        density = self.global_rng.random()
+        print(f"New density: {density:.2f}")
+        intensity = self.global_rng.uniform(1.0, 5.0)
+        print(f"New intensity: {intensity:.2f}")
         for track in self.tracks:
             track.pattern = Pattern.random(self.steps, max(1, len(track.samples)), rng=track.rng, pattern_density=density, pattern_intensity=intensity)
         
-        self.loop_target = random.randint(self.config.repeat_min, self.config.repeat_max)
+        self.loop_target = self.global_rng.randint(self.config.repeat_min, self.config.repeat_max)
         print(f"[Regenerated patterns. Next repeat: {self.loop_target}]")
 
 # ---------------- Main entry --------------------
@@ -611,6 +611,13 @@ def main():
         print("Please run the microsample database builder first.")
         sys.exit(1)
     
+    if args.seed:
+        print(f"Random seed: ")
+    
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    global_rng = random.Random(args.seed)
+
     # Check if samples directory exists
     if not os.path.exists(args.samples_dir):
         print(f"Error: Samples directory '{args.samples_dir}' not found!")
@@ -618,7 +625,7 @@ def main():
     
     # Load samples from database
     print("Loading samples from database...")
-    samples_by_type = load_samples_from_db(args.db_path, args.samples_dir, args.samples_per_track)
+    samples_by_type = load_samples_from_db(args.db_path, args.samples_dir, args.samples_per_track, global_rng)
     
     # Check if we have enough samples
     total_samples = sum(len(samples) for samples in samples_by_type.values())
@@ -631,7 +638,7 @@ def main():
         print(f"  {stem_type}: {len(samples)} samples")
     
     # Create and start sequencer
-    sequencer = SampleAccurateSequencer(samples_by_type, args)
+    sequencer = SampleAccurateSequencer(samples_by_type, args, global_rng)
     
     try:
         sequencer.start()
