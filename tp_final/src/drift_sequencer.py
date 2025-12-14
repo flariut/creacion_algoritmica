@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-    Nueva versión del sequencer.
-    Todos los parámetros avanzan con random walks.
-    Se agrega logueo de eventos directo a disco,
-    saturación y limitador de salida para más placer.
+Nueva versión del sequencer.
+Casi todos los parámetros avanzan con random walks.
+Se agrega logueo de eventos directo a disco,
+saturación y limitador de salida para más placer.
 """
 
 import os
@@ -50,6 +50,21 @@ sequencer:
 
 processing:
   fade_duration: 0.005
+
+  # AHD (Attack / Hold / Decay) envelope per-trigger
+  # Razonable para microsamples ~500ms:
+  # - Attack: corto (2..60ms)
+  # - Hold: 0..250ms
+  # - Decay: 20..450ms
+  # Se clampa al largo real del buffer ya resampleado.
+  envelope:
+    enabled: true
+    attack_ms_min: 2.0
+    attack_ms_max: 60.0
+    hold_ms_min: 0.0
+    hold_ms_max: 250.0
+    decay_ms_min: 20.0
+    decay_ms_max: 450.0
 
 stack:
   enabled: true
@@ -153,10 +168,10 @@ def _clamp_int(x: int, lo: int, hi: int) -> int:
 
 def get_channel_mapping(output_channels: int) -> Dict[str, int]:
     if output_channels == 1:
-        return {'drums': 0, 'bass': 0, 'other': 0, 'vocals': 0}
+        return {"drums": 0, "bass": 0, "other": 0, "vocals": 0}
     if output_channels == 2:
-        return {'drums': 0, 'bass': 0, 'other': 1, 'vocals': 1}
-    return {'drums': 0, 'bass': 1, 'other': 2, 'vocals': 3}
+        return {"drums": 0, "bass": 0, "other": 1, "vocals": 1}
+    return {"drums": 0, "bass": 1, "other": 2, "vocals": 3}
 
 
 # ---------------- DSP helpers -------------------
@@ -235,6 +250,142 @@ def lowpass_4pole(signal: np.ndarray, cutoff: float, sr: int) -> np.ndarray:
     return out
 
 
+# ----------- AHD Envelope (per-trigger) -----------
+
+def _ms_to_samples(ms: float, sr: int) -> int:
+    return max(0, int(round(float(ms) * sr / 1000.0)))
+
+
+def random_ahd_envelope_ms(
+    rng: random.Random,
+    total_ms: float,
+    attack_ms_min: float,
+    attack_ms_max: float,
+    hold_ms_min: float,
+    hold_ms_max: float,
+    decay_ms_min: float,
+    decay_ms_max: float,
+):
+    total_ms = max(0.0, float(total_ms))
+    if total_ms <= 0.0:
+        return 0.0, 0.0, 0.0
+
+    a_lo = max(0.0, float(attack_ms_min))
+    a_hi = max(a_lo, float(attack_ms_max))
+    h_lo = max(0.0, float(hold_ms_min))
+    h_hi = max(h_lo, float(hold_ms_max))
+    d_lo_cfg = max(0.0, float(decay_ms_min))
+    d_hi_cfg = max(d_lo_cfg, float(decay_ms_max))
+
+    # Attack
+    a_hi_eff = min(a_hi, total_ms)
+    if a_hi_eff < a_lo:
+        a = a_hi_eff
+    elif a_hi_eff == a_lo:
+        a = a_lo
+    else:
+        a = rng.uniform(a_lo, a_hi_eff)
+
+    remaining = max(0.0, total_ms - a)
+
+    # Decay
+    d_hi_eff = min(d_hi_cfg, remaining)
+    d_lo_eff = min(d_lo_cfg, d_hi_eff)
+    if d_hi_eff < d_lo_eff:
+        d = d_hi_eff
+    elif d_hi_eff == d_lo_eff:
+        d = d_lo_eff
+    else:
+        d = rng.uniform(d_lo_eff, d_hi_eff)
+
+    remaining2 = max(0.0, total_ms - a - d)
+
+    # Hold  (FIXED HERE)
+    h_hi_eff = min(h_hi, remaining2)
+    if h_hi_eff < h_lo:
+        h = h_hi_eff
+    elif h_hi_eff == h_lo:
+        h = h_lo
+    else:
+        h = rng.uniform(h_lo, h_hi_eff)
+
+    # final clamp (safety)
+    s = a + h + d
+    if s > total_ms:
+        overflow = s - total_ms
+        dh = min(h, overflow); h -= dh; overflow -= dh
+        if overflow > 0:
+            dd = min(d, overflow); d -= dd; overflow -= dd
+        if overflow > 0:
+            da = min(a, overflow); a -= da
+
+    return max(0.0, a), max(0.0, h), max(0.0, d)
+
+
+def apply_ahd_envelope(signal: np.ndarray, sr: int, attack_ms: float, hold_ms: float, decay_ms: float) -> np.ndarray:
+    """
+    Click-safe AHD:
+      - attack: cosine ramp 0->1 (includes both endpoints)
+      - hold:   1
+      - decay:  cosine ramp 1->0 (includes both endpoints, ends at EXACT 0)
+    Remaining tail stays at 0.
+    """
+    if signal.size == 0:
+        return signal
+
+    n = int(signal.shape[0])
+    if n <= 0:
+        return signal
+
+    a_n = _ms_to_samples(attack_ms, sr)
+    h_n = _ms_to_samples(hold_ms, sr)
+    d_n = _ms_to_samples(decay_ms, sr)
+
+    # Clamp total length to buffer length (reduce hold first, then decay, then attack)
+    total = a_n + h_n + d_n
+    if total > n:
+        overflow = total - n
+        dh = min(h_n, overflow); h_n -= dh; overflow -= dh
+        if overflow > 0:
+            dd = min(d_n, overflow); d_n -= dd; overflow -= dd
+        if overflow > 0:
+            da = min(a_n, overflow); a_n -= da
+
+    env = np.zeros((n,), dtype=np.float32)
+    pos = 0
+
+    # Attack (cosine from 0 to 1)
+    if a_n > 0:
+        if a_n == 1:
+            env[pos] = 1.0
+            pos += 1
+        else:
+            t = np.linspace(0.0, 1.0, a_n, endpoint=True, dtype=np.float32)
+            env[pos:pos + a_n] = 0.5 - 0.5 * np.cos(np.pi * t)  # 0..1
+            pos += a_n
+
+    # Hold
+    if h_n > 0:
+        env[pos:pos + h_n] = 1.0
+        pos += h_n
+
+    # Decay (cosine from 1 to 0) -> ensures last decay sample is exactly 0
+    if d_n > 0:
+        if d_n == 1:
+            env[pos] = 0.0
+            pos += 1
+        else:
+            t = np.linspace(0.0, 1.0, d_n, endpoint=True, dtype=np.float32)
+            env[pos:pos + d_n] = 0.5 + 0.5 * np.cos(np.pi * t)  # 1..0
+            pos += d_n
+
+    if signal.ndim == 1:
+        signal *= env
+    else:
+        signal *= env[:, None]
+    return signal
+
+
 def _soft_clip_tube_channel(x: np.ndarray, drive: float, asym: float) -> np.ndarray:
     y = x * drive
     pos_scale = 1.0 + max(0.0, asym)
@@ -245,12 +396,10 @@ def _soft_clip_tube_channel(x: np.ndarray, drive: float, asym: float) -> np.ndar
 
 
 def apply_soft_clip(out: np.ndarray, mode: str, drive: float, asym: float) -> np.ndarray:
-
     mode = (mode or "tube").lower().strip()
     if mode == "tanh":
         out[:] = np.tanh(out * drive)
     else:
-        # "tube"
         for ch in range(out.shape[1]):
             out[:, ch] = _soft_clip_tube_channel(out[:, ch], drive, asym)
 
@@ -261,13 +410,6 @@ def apply_soft_clip(out: np.ndarray, mode: str, drive: float, asym: float) -> np
 class MasterLimiter:
     """
     Lightweight peak limiter (no lookahead) with attack/release smoothing.
-
-    Fixes vs previous version:
-    - Attack/release coefficients are computed for the *actual update rate*.
-      If you call process() once per audio block, you must account for `frames`
-      or the limiter becomes ~blocksize times slower than intended.
-    - Optional "instant catch" (enabled by default) to clamp the current block
-      immediately when it exceeds threshold; smoothing mainly affects recovery.
     """
     def __init__(
         self,
@@ -284,30 +426,19 @@ class MasterLimiter:
         self.release_ms = float(release_ms)
         self.pre_gain = float(pre_gain)
         self.instant_catch = bool(instant_catch)
-
         self.gain = 1.0
 
     def _coeff(self, ms: float, frames: int) -> float:
-        """
-        One-pole smoothing coefficient for an update step that represents `frames` samples.
-        Equivalent to applying per-sample smoothing `frames` times.
-        """
         ms = max(0.1, float(ms))
         frames = max(1, int(frames))
         t = ms / 1000.0
-        # exp(-N/(t*sr)) is the correct block-rate equivalent coefficient
         return math.exp(-float(frames) / (t * self.sr))
 
     def process(self, x: np.ndarray, frames: Optional[int] = None) -> np.ndarray:
-        """
-        Process an interleaved block `x` shaped (frames, channels) or any array.
-        Pass `frames` if you call this once per callback block; otherwise we infer frames
-        from x.shape[0] when possible.
-        """
         if x.size == 0:
             return x
-        
-        x *= self.pre_gain;
+
+        x *= self.pre_gain
 
         if frames is None:
             frames = int(x.shape[0]) if x.ndim >= 1 else 1
@@ -318,22 +449,18 @@ class MasterLimiter:
         if peak <= 0.0:
             return x
 
-        # required gain to bring peak to threshold (or less)
         target_gain = 1.0 if peak <= thr else (thr / peak)
 
-        # Optional immediate clamp for this block (catches first transient)
         if self.instant_catch and target_gain < 1.0:
             if target_gain < self.gain:
                 self.gain = target_gain
 
-        # Smooth toward target (attack when going down, release when going up)
         if target_gain < self.gain:
             c = self._coeff(self.attack_ms, frames)
         else:
             c = self._coeff(self.release_ms, frames)
 
         self.gain = c * self.gain + (1.0 - c) * target_gain
-
         x *= self.gain
         return x
 
@@ -368,7 +495,7 @@ class SampleDatabase:
         """
         cursor.execute(query, (stem_type,))
         rows = cursor.fetchall()
-        self.rng.shuffle(rows)  # deterministic given rng state
+        self.rng.shuffle(rows)
 
         if limit is not None:
             rows = rows[:limit]
@@ -383,15 +510,17 @@ class SampleDatabase:
                 data, sr = sf.read(audio_path, always_2d=False)
                 data = np.asarray(data, dtype=np.float32)
                 metadata = json.loads(metadata_json) if metadata_json else {}
-                samples.append(Sample(
-                    data=data,
-                    sr=sr,
-                    name=f"{metadata.get('artist', 'Unknown')} - {metadata.get('song_title', 'Unknown')} - {stem_type_row}",
-                    stem_type=stem_type_row,
-                    original_position=position,
-                    rms=metadata.get('rms', 0.5),
-                    duration=float(duration) if duration is not None else float(len(data) / sr)
-                ))
+                samples.append(
+                    Sample(
+                        data=data,
+                        sr=sr,
+                        name=f"{metadata.get('artist', 'Unknown')} - {metadata.get('song_title', 'Unknown')} - {stem_type_row}",
+                        stem_type=stem_type_row,
+                        original_position=position,
+                        rms=metadata.get("rms", 0.5),
+                        duration=float(duration) if duration is not None else float(len(data) / sr),
+                    )
+                )
             except Exception as e:
                 print(f"Error loading sample {filename}: {e}")
                 continue
@@ -406,7 +535,7 @@ class SampleDatabase:
 def load_samples_from_db(db_path: str, samples_dir: str, samples_per_track: int, rng: random.Random) -> Dict[str, List[Sample]]:
     db = SampleDatabase(db_path, samples_dir, rng)
     samples_by_type: Dict[str, List[Sample]] = {}
-    for stem_type in ['drums', 'bass', 'other', 'vocals']:
+    for stem_type in ["drums", "bass", "other", "vocals"]:
         samples_by_type[stem_type] = db.get_samples_by_stem_type(stem_type, samples_per_track)
         if not samples_by_type[stem_type]:
             print(f"Warning: No {stem_type} samples found in database!")
@@ -426,6 +555,11 @@ class Step:
     gain: float
     lowpass: float
 
+    # Per-trigger AHD envelope params (ms); these are set at trigger-time (variability)
+    attack_ms: float = 0.0
+    hold_ms: float = 0.0
+    decay_ms: float = 0.0
+
 
 @dataclass
 class Pattern:
@@ -435,15 +569,20 @@ class Pattern:
     def random(cls, steps: int, sample_count: int, rng: random.Random, pattern_density: float, pattern_intensity: float):
         p = cls()
         for i in range(steps):
-            p.steps.append(Step(
-                index=i,
-                sample_idx=rng.randrange(max(1, sample_count)),
-                on=(rng.random() < pattern_density),
-                prob=rng.uniform(0.1, 1.0),
-                semitone=0.0,
-                gain=rng.uniform(0.1 * pattern_intensity, 0.2 * pattern_intensity),
-                lowpass=20000.0
-            ))
+            p.steps.append(
+                Step(
+                    index=i,
+                    sample_idx=rng.randrange(max(1, sample_count)),
+                    on=(rng.random() < pattern_density),
+                    prob=rng.uniform(0.1, 1.0),
+                    semitone=0.0,
+                    gain=rng.uniform(0.1 * pattern_intensity, 0.2 * pattern_intensity),
+                    lowpass=20000.0,
+                    attack_ms=0.0,
+                    hold_ms=0.0,
+                    decay_ms=0.0,
+                )
+            )
         return p
 
 
@@ -490,7 +629,6 @@ class Clock:
             self.step_counter = 0
             self.next_step_sample = self.samples_per_step
         else:
-            # keep time continuous; schedule next step relative to "now"
             self.next_step_sample = self.sample_pos + self.samples_per_step
 
     def advance(self, frames: int) -> List[Tuple[int, int]]:
@@ -509,11 +647,9 @@ class Clock:
 class RunLogger:
     """
     Streams run data to disk as NDJSON lines (JSONL):
-      - meta.json            (single JSON)
-      - patterns.jsonl       (one JSON object per pattern creation)
-      - events.jsonl         (one JSON object per event)
-
-    This avoids storing all patterns/events in RAM and supports multi-hour runs.
+      - meta.json
+      - patterns.jsonl
+      - events.jsonl
     """
     def __init__(self, run_meta: Dict[str, Any], runs_dir: Path = Path("runs")):
         self.runs_dir = runs_dir
@@ -527,12 +663,11 @@ class RunLogger:
         self.patterns_path = self.run_dir / "patterns.jsonl"
         self.events_path = self.run_dir / "events.jsonl"
 
-        # Write meta immediately
         run_meta = dict(run_meta)
         run_meta.setdefault("timestamp", time.strftime("%Y-%m-%d %H:%M:%S"))
         self.meta_path.write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
 
-        self._pat_f = open(self.patterns_path, "a", encoding="utf-8", buffering=1)  # line buffered
+        self._pat_f = open(self.patterns_path, "a", encoding="utf-8", buffering=1)
         self._evt_f = open(self.events_path, "a", encoding="utf-8", buffering=1)
 
         self.pattern_index = 0
@@ -543,22 +678,27 @@ class RunLogger:
     def _snapshot_tracks_pattern(self, sequencer: "Sequencer") -> List[Dict[str, Any]]:
         tracks_meta: List[Dict[str, Any]] = []
         for t in sequencer.tracks:
-            steps_meta = [{
-                "index": int(s.index),
-                "sample_idx": int(s.sample_idx),
-                "on": bool(s.on),
-                "prob": float(s.prob),
-                "semitone": float(s.semitone),
-                "gain": float(s.gain),
-                "lowpass": float(s.lowpass),
-            } for s in t.pattern.steps]
-            tracks_meta.append({
-                "track_id": int(t.id),
-                "stem_type": t.stem_type,
-                "channel": int(t.channel),
-                "sample_count": int(len(t.samples)),
-                "steps": steps_meta,
-            })
+            steps_meta = [
+                {
+                    "index": int(s.index),
+                    "sample_idx": int(s.sample_idx),
+                    "on": bool(s.on),
+                    "prob": float(s.prob),
+                    "semitone": float(s.semitone),
+                    "gain": float(s.gain),
+                    "lowpass": float(s.lowpass),
+                }
+                for s in t.pattern.steps
+            ]
+            tracks_meta.append(
+                {
+                    "track_id": int(t.id),
+                    "stem_type": t.stem_type,
+                    "channel": int(t.channel),
+                    "sample_count": int(len(t.samples)),
+                    "steps": steps_meta,
+                }
+            )
         return tracks_meta
 
     def start_pattern(self, sequencer: "Sequencer", reason: str):
@@ -566,16 +706,13 @@ class RunLogger:
             "pattern_index": int(self.pattern_index),
             "reason": str(reason),
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-
             "bpm": float(sequencer.bpm),
             "steps": int(sequencer.steps),
             "repeat_min": int(sequencer.repeat_min),
             "repeat_max": int(sequencer.repeat_max),
             "loop_target": int(sequencer.loop_target),
-
             "density": float(sequencer.density),
             "intensity_base": float(sequencer.intensity_base),
-
             "tracks": self._snapshot_tracks_pattern(sequencer),
         }
         self._pat_f.write(json.dumps(pat) + "\n")
@@ -584,7 +721,6 @@ class RunLogger:
 
     def log_event(self, ev: Dict[str, Any]):
         if self.current_pattern_index is None:
-            # should not happen, but keep robust
             self.current_pattern_index = -1
         ev = dict(ev)
         ev["pattern_index"] = int(self.current_pattern_index)
@@ -613,6 +749,15 @@ class Sequencer:
 
         self.reverse_prob = _clamp(float(cfg_get(cfg, "sequencer.reverse_prob")), 0.0, 1.0)
 
+        # envelope config
+        self.env_enabled = bool(cfg_get(cfg, "processing.envelope.enabled", True))
+        self.env_attack_ms_min = float(cfg_get(cfg, "processing.envelope.attack_ms_min", 2.0))
+        self.env_attack_ms_max = float(cfg_get(cfg, "processing.envelope.attack_ms_max", 60.0))
+        self.env_hold_ms_min = float(cfg_get(cfg, "processing.envelope.hold_ms_min", 0.0))
+        self.env_hold_ms_max = float(cfg_get(cfg, "processing.envelope.hold_ms_max", 250.0))
+        self.env_decay_ms_min = float(cfg_get(cfg, "processing.envelope.decay_ms_min", 20.0))
+        self.env_decay_ms_max = float(cfg_get(cfg, "processing.envelope.decay_ms_max", 450.0))
+
         self.stack_enabled = bool(cfg_get(cfg, "stack.enabled"))
         self.stack_prob = float(cfg_get(cfg, "stack.prob"))
         self.stack_max = max(1, int(cfg_get(cfg, "stack.max")))
@@ -638,11 +783,9 @@ class Sequencer:
         self.density_min = float(cfg_get(cfg, "drift.density_min"))
         self.density_max = float(cfg_get(cfg, "drift.density_max"))
 
-        # intensity (coarse) random-walk
         self.intensity_min = float(cfg_get(cfg, "drift.intensity_regen_min"))
         self.intensity_max = float(cfg_get(cfg, "drift.intensity_regen_max"))
         self.intensity_rate = float(cfg_get(cfg, "drift.intensity_rate", 0.6))
-
         self.intensity_step_jitter = float(cfg_get(cfg, "drift.intensity_step_jitter"))
 
         # mutable sequencer state
@@ -651,15 +794,13 @@ class Sequencer:
         self.repeat_min = int(cfg_get(cfg, "sequencer.repeat_min"))
         self.repeat_max = int(cfg_get(cfg, "sequencer.repeat_max"))
 
-        # global musical state (seeded)
         self.density = _clamp(self.rng.random(), self.density_min, self.density_max)
-        # start intensity inside [1,5]
         self.intensity_base = _clamp(self.rng.uniform(self.intensity_min, self.intensity_max), self.intensity_min, self.intensity_max)
 
         # tracks
         self.channel_map = get_channel_mapping(self.channels)
         self.tracks: List[Track] = []
-        for i, stem_type in enumerate(['drums', 'bass', 'other', 'vocals']):
+        for i, stem_type in enumerate(["drums", "bass", "other", "vocals"]):
             samples = samples_by_type.get(stem_type, [])
             track_rng = random.Random(self.rng.randint(0, 2**30))
             tr = Track(
@@ -668,7 +809,7 @@ class Sequencer:
                 channel=self.channel_map[stem_type],
                 samples=samples,
                 pattern=Pattern(),
-                rng=track_rng
+                rng=track_rng,
             )
             tr.played_stack = deque(maxlen=self.stack_max)
             tr.stack_ages = {}
@@ -678,58 +819,59 @@ class Sequencer:
         self.loop_count = 0
         self.loop_target = 1
 
-        # init block
         self.create_pattern_block(reason="init", drift=False)
 
     def _print_pattern_stats(self, reason: str):
         per_track = ", ".join(f"{t.stem_type}:samples={len(t.samples)},ch={t.channel}" for t in self.tracks)
         print(
-            "\n".join([
-                "",
-                f"[PatternBlock] reason={reason}",
-                f"  bpm={self.bpm:.3f}  steps={self.steps}",
-                f"  repeat_min={self.repeat_min}  repeat_max={self.repeat_max}  loop_target={self.loop_target}",
-                f"  density={self.density:.3f}",
-                f"  intensity_base={self.intensity_base:.3f} (coarse RW [{self.intensity_min:.1f},{self.intensity_max:.1f}] rate=±{self.intensity_rate:.3f})",
-                f"  intensity_step_jitter=±{self.intensity_step_jitter:.3f}  (mult = clamp(1+U(-j,+j),>=0))",
-                f"  reverse_prob={self.reverse_prob:.3f}",
-                f"  stack_enabled={self.stack_enabled}  stack_prob={self.stack_prob:.3f}  stack_max={self.stack_max}  stack_decay_steps={self.stack_decay_steps}",
-                f"  tracks: {per_track}",
-                ""
-            ])
+            "\n".join(
+                [
+                    "",
+                    f"[PatternBlock] reason={reason}",
+                    f"  bpm={self.bpm:.3f}  steps={self.steps}",
+                    f"  repeat_min={self.repeat_min}  repeat_max={self.repeat_max}  loop_target={self.loop_target}",
+                    f"  density={self.density:.3f}",
+                    f"  intensity_base={self.intensity_base:.3f} (coarse RW [{self.intensity_min:.1f},{self.intensity_max:.1f}] rate=±{self.intensity_rate:.3f})",
+                    f"  intensity_step_jitter=±{self.intensity_step_jitter:.3f}  (mult = clamp(1+U(-j,+j),>=0))",
+                    f"  reverse_prob={self.reverse_prob:.3f}",
+                    f"  env_enabled={self.env_enabled}  A=[{self.env_attack_ms_min:.1f},{self.env_attack_ms_max:.1f}]ms  "
+                    f"H=[{self.env_hold_ms_min:.1f},{self.env_hold_ms_max:.1f}]ms  D=[{self.env_decay_ms_min:.1f},{self.env_decay_ms_max:.1f}]ms",
+                    f"  stack_enabled={self.stack_enabled}  stack_prob={self.stack_prob:.3f}  stack_max={self.stack_max}  stack_decay_steps={self.stack_decay_steps}",
+                    f"  tracks: {per_track}",
+                    "",
+                ]
+            )
         )
 
     def create_pattern_block(self, reason: str, drift: bool):
-        """
-        Unified init/regenerate:
-        - (optional) drift bpm/steps/repeat bounds/density/intensity_base (ALL random-walk)
-        - rebuild per-track patterns
-        - choose loop_target
-        - stream pattern snapshot to disk
-        - print full stats
-        """
         if drift and self.drift_enabled:
             self.bpm = _clamp(self.bpm + self.rng.uniform(-self.bpm_rate, self.bpm_rate), self.bpm_min, self.bpm_max)
-
             self.steps = _clamp_int(self.steps + self.rng.randint(-self.steps_rate, self.steps_rate), self.steps_min, self.steps_max)
 
             self.repeat_min = _clamp_int(
                 self.repeat_min + self.rng.randint(-self.repeat_min_rate, self.repeat_min_rate),
-                self.repeat_min_floor, self.repeat_max_ceil
+                self.repeat_min_floor,
+                self.repeat_max_ceil,
             )
             self.repeat_max = _clamp_int(
                 self.repeat_max + self.rng.randint(-self.repeat_max_rate, self.repeat_max_rate),
-                self.repeat_min_floor, self.repeat_max_ceil
+                self.repeat_min_floor,
+                self.repeat_max_ceil,
             )
             if self.repeat_max < self.repeat_min:
                 self.repeat_max = self.repeat_min
 
-            self.density = _clamp(self.density + self.rng.uniform(-self.density_rate, self.density_rate),
-                                  self.density_min, self.density_max)
+            self.density = _clamp(
+                self.density + self.rng.uniform(-self.density_rate, self.density_rate),
+                self.density_min,
+                self.density_max,
+            )
 
-            # intensity coarse random walk (NOT fresh draw)
-            self.intensity_base = _clamp(self.intensity_base + self.rng.uniform(-self.intensity_rate, self.intensity_rate),
-                                         self.intensity_min, self.intensity_max)
+            self.intensity_base = _clamp(
+                self.intensity_base + self.rng.uniform(-self.intensity_rate, self.intensity_rate),
+                self.intensity_min,
+                self.intensity_max,
+            )
 
         for track in self.tracks:
             track.pattern = Pattern.random(
@@ -737,7 +879,7 @@ class Sequencer:
                 sample_count=max(1, len(track.samples)),
                 rng=track.rng,
                 pattern_density=self.density,
-                pattern_intensity=self.intensity_base
+                pattern_intensity=self.intensity_base,
             )
 
         self.loop_target = self.rng.randint(self.repeat_min, self.repeat_max)
@@ -750,7 +892,7 @@ class Sequencer:
         j = max(0.0, float(self.intensity_step_jitter))
         return max(0.0, 1.0 + self.rng.uniform(-j, j))
 
-    def decide_for_step(self, global_step: int, step_index: int) -> List[Tuple[Track, Sample, bool, bool, Step, float]]:
+    def decide_for_step(self, global_step: int, step_index: int) -> List[Tuple["Track", Sample, bool, bool, Step, float]]:
         results: List[Tuple[Track, Sample, bool, bool, Step, float]] = []
         intensity_mult = self._step_intensity_multiplier()
 
@@ -762,7 +904,6 @@ class Sequencer:
             used_stack = False
             chosen_sample: Optional[Sample] = None
 
-            # stack pick
             if self.stack_enabled and (track.rng.random() < self.stack_prob) and len(track.played_stack) > 0:
                 with track.stack_lock:
                     n = len(track.played_stack)
@@ -791,7 +932,27 @@ class Sequencer:
 
             reversed_play = (track.rng.random() < self.reverse_prob)
 
-            # apply per-step intensity multiplier to gain at trigger-time
+            # Per-trigger envelope (AHD), generated here so it gets logged with the event.
+            if self.env_enabled:
+                # We assume microsamples are ~500ms, but clamp to actual sample duration.
+                # Use sample.duration if present; otherwise infer from raw buffer.
+                total_ms = float(getattr(chosen_sample, "duration", 0.0)) * 1000.0
+                if total_ms <= 0.0:
+                    total_ms = 1000.0 * (len(chosen_sample.data) / max(1, chosen_sample.sr))
+
+                a_ms, h_ms, d_ms = random_ahd_envelope_ms(
+                    rng=track.rng,
+                    total_ms=total_ms,
+                    attack_ms_min=self.env_attack_ms_min,
+                    attack_ms_max=self.env_attack_ms_max,
+                    hold_ms_min=self.env_hold_ms_min,
+                    hold_ms_max=self.env_hold_ms_max,
+                    decay_ms_min=self.env_decay_ms_min,
+                    decay_ms_max=self.env_decay_ms_max,
+                )
+            else:
+                a_ms = h_ms = d_ms = 0.0
+
             eff_step = Step(
                 index=step.index,
                 sample_idx=step.sample_idx,
@@ -799,7 +960,10 @@ class Sequencer:
                 prob=step.prob,
                 semitone=step.semitone,
                 gain=step.gain * intensity_mult,
-                lowpass=step.lowpass
+                lowpass=step.lowpass,
+                attack_ms=a_ms,
+                hold_ms=h_ms,
+                decay_ms=d_ms,
             )
             results.append((track, chosen_sample, used_stack, reversed_play, eff_step, intensity_mult))
 
@@ -817,7 +981,6 @@ class Sequencer:
                 track.played_stack.append(idx)
                 track.stack_ages[idx] = 0
 
-            # deque maxlen enforces size, but we must sync ages for any dropped item:
             while len(track.played_stack) > self.stack_max:
                 old_idx = track.played_stack.popleft()
                 track.stack_ages.pop(old_idx, None)
@@ -837,19 +1000,26 @@ class Sequencer:
                         pass
                     track.stack_ages.pop(idx, None)
 
-    def record_event(self, step_sample_pos: int, global_step: int, step_index: int,
-                     track: Track, sample: Sample, used_stack: bool, reversed_play: bool,
-                     step_obj: Step, intensity_mult: float):
+    def record_event(
+        self,
+        step_sample_pos: int,
+        global_step: int,
+        step_index: int,
+        track: Track,
+        sample: Sample,
+        used_stack: bool,
+        reversed_play: bool,
+        step_obj: Step,
+        intensity_mult: float,
+    ):
         ev = {
             "time": time.time(),
             "sample_pos": int(step_sample_pos),
             "global_step": int(global_step),
             "step_index": int(step_index),
-
             "track_id": int(track.id),
             "track_type": track.stem_type,
             "channel": int(track.channel),
-
             "sample_name": sample.name,
             "gain": float(step_obj.gain),
             "semitone": float(step_obj.semitone),
@@ -857,12 +1027,16 @@ class Sequencer:
             "prob": float(step_obj.prob),
             "used_stack": bool(used_stack),
             "reversed": bool(reversed_play),
-
+            "env": {
+                "type": "AHD",
+                "attack_ms": float(step_obj.attack_ms),
+                "hold_ms": float(step_obj.hold_ms),
+                "decay_ms": float(step_obj.decay_ms),
+            },
             "bpm": float(self.bpm),
             "steps": int(self.steps),
             "repeat_min": int(self.repeat_min),
             "repeat_max": int(self.repeat_max),
-
             "density": float(self.density),
             "intensity_base": float(self.intensity_base),
             "intensity_step_mult": float(intensity_mult),
@@ -884,6 +1058,8 @@ class AudioEngine:
         self.latency = cfg_get(cfg, "audio.latency")
 
         self.fade_samples = int(float(cfg_get(cfg, "processing.fade_duration")) * self.sr)
+
+        self.env_enabled = bool(cfg_get(cfg, "processing.envelope.enabled", True))
 
         self.clip_mode = str(cfg_get(cfg, "clip.mode", "tube"))
         self.clip_drive = float(cfg_get(cfg, "clip.drive"))
@@ -912,7 +1088,7 @@ class AudioEngine:
             channels=self.channels_out,
             dtype="float32",
             latency=self.latency,
-            callback=self.callback
+            callback=self.callback,
         )
         self.running = False
 
@@ -931,8 +1107,10 @@ class AudioEngine:
 
     def schedule_play(self, sample: Sample, channel: int, reversed_play: bool, step: Step):
         sig = sample.data.copy()
+
         if reversed_play:
             sig = sig[::-1]
+
         if sample.sr != self.sr:
             sig = resample_linear(sig, sample.sr / self.sr)
 
@@ -946,6 +1124,16 @@ class AudioEngine:
         if sig.ndim > 1:
             sig = np.mean(sig, axis=1)
 
+        # Apply AHD envelope per-trigger (uses step.attack_ms/hold_ms/decay_ms)
+        if self.env_enabled and (step.attack_ms > 0.0 or step.hold_ms > 0.0 or step.decay_ms > 0.0):
+            # Clamp envelope to *actual* buffer length post-processing
+            total_ms_actual = 1000.0 * (len(sig) / max(1, self.sr))
+            a = min(step.attack_ms, total_ms_actual)
+            h = min(step.hold_ms, max(0.0, total_ms_actual - a))
+            d = min(step.decay_ms, max(0.0, total_ms_actual - a - h))
+            sig = apply_ahd_envelope(sig, self.sr, a, h, d)
+
+        # Keep a small safety fade to avoid clicks in edge cases (very short A/D)
         sig = apply_fade(sig, self.fade_samples)
 
         ev = PlayEvent(np.asarray(sig, dtype=np.float32), channel)
@@ -965,7 +1153,7 @@ class AudioEngine:
                     continue
                 n = min(length, remaining)
                 if ev.channel < out.shape[1]:
-                    out[start:start + n, ev.channel] += ev.buffer[ev.pos:ev.pos + n]
+                    out[start : start + n, ev.channel] += ev.buffer[ev.pos : ev.pos + n]
                 ev.pos += n
 
     def callback(self, outdata, frames, time_info, status):
@@ -992,7 +1180,6 @@ class AudioEngine:
 
             self.seq.age_and_decay_stacks()
 
-            # pattern cycle bookkeeping
             if step_index == (self.seq.steps - 1):
                 self.seq.loop_count += 1
                 if self.seq.loop_count >= self.seq.loop_target:
@@ -1002,7 +1189,6 @@ class AudioEngine:
         if local_cursor < frames:
             self._mix_active_into(out, local_cursor, frames)
 
-        # post-mix shaping
         apply_soft_clip(out, self.clip_mode, self.clip_drive, self.clip_asym)
         if self.limiter is not None:
             self.limiter.process(out)

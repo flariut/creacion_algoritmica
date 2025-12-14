@@ -1,10 +1,10 @@
-db_path: "microsamples.db"
-samples_dir: "samples"
+db_path: "clics-modernos.db"
+samples_dir: "clics_modernos_samples"
 
 audio:
   sr: 44100
   blocksize: 4096
-  channels: 1          # 1=mono, 2=stereo, 4=quad
+  channels: 2          # 1=mono, 2=stereo, 4=quad
   latency: "high"
 
 sequencer:
@@ -13,10 +13,25 @@ sequencer:
   repeat_min: 4
   repeat_max: 16
   reverse_prob: 0.2
-  samples_per_track: 9999
+  samples_per_track: 1000
 
 processing:
-  fade_duration: 0.005
+  fade_duration: 0.001
+
+  # AHD (Attack / Hold / Decay) envelope per-trigger
+  # Razonable para microsamples ~500ms:
+  # - Attack: corto (2..60ms)
+  # - Hold: 0..250ms
+  # - Decay: 20..450ms
+  # Se clampa al largo real del buffer ya resampleado.
+  envelope:
+    enabled: true
+    attack_ms_min: 2.0
+    attack_ms_max: 125.0
+    hold_ms_min: 0.0
+    hold_ms_max: 250.0
+    decay_ms_min: 2.0
+    decay_ms_max: 125.0
 
 stack:
   enabled: true
@@ -26,7 +41,7 @@ stack:
 
 clip:
   mode: "tube"         # "tube" (asym tanh) or "tanh" (simple tanh)
-  drive: 2.0
+  drive: 1.0
   asym: -0.3
 
 limiter:
