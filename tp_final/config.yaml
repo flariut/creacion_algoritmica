@@ -1,0 +1,85 @@
+db_path: "clics-modernos.db"
+samples_dir: "clics_modernos_samples"
+
+audio:
+  sr: 44100
+  blocksize: 4096
+  channels: 2          # 1=mono, 2=stereo, 4=quad
+  latency: "high"
+
+sequencer:
+  bpm: 120.0
+  steps: 16
+  repeat_min: 4
+  repeat_max: 16
+  reverse_prob: 0.2
+  samples_per_track: 1000
+
+processing:
+  fade_duration: 0.001
+
+  # AHD (Attack / Hold / Decay) envelope per-trigger
+  # Razonable para microsamples ~500ms:
+  # - Attack: corto (2..60ms)
+  # - Hold: 0..250ms
+  # - Decay: 20..450ms
+  # Se clampa al largo real del buffer ya resampleado.
+  envelope:
+    enabled: true
+    attack_ms_min: 2.0
+    attack_ms_max: 125.0
+    hold_ms_min: 0.0
+    hold_ms_max: 250.0
+    decay_ms_min: 2.0
+    decay_ms_max: 125.0
+
+stack:
+  enabled: true
+  prob: 0.05
+  max: 64
+  decay_steps: 128
+
+clip:
+  mode: "tube"         # "tube" (asym tanh) or "tanh" (simple tanh)
+  drive: 1.0
+  asym: -0.3
+
+limiter:
+  enabled: true
+  threshold: 0.98      # peak ceiling
+  attack_ms: 2.0
+  release_ms: 80.0
+  pre_gain: 3.0
+
+random:
+  seed: null
+
+drift:
+  enabled: true
+
+  # applied each pattern regeneration (random-walk style)
+  bpm_rate: 10.0        # +/- bpm
+  bpm_min: 40.0
+  bpm_max: 220.0
+
+  steps_rate: 2         # +/- steps (integer)
+  steps_min: 4
+  steps_max: 64
+
+  repeat_min_rate: 1    # +/- (integer)
+  repeat_max_rate: 2    # +/- (integer)
+  repeat_min_floor: 1
+  repeat_max_ceil: 128
+
+  density_rate: 0.20    # +/- density
+  density_min: 0.01
+  density_max: 0.99
+
+  # intensity is COARSE random-walk clamped to [1, 5]
+  intensity_regen_min: 1.0
+  intensity_regen_max: 5.0
+  intensity_rate: 0.6   # +/- per regeneration (random-walk)
+
+  # small per-step variation: multiplier = clamp(1 + U(-j, +j), >=0)
+  # j=1.0 => multiplier range [0, 2]
+  intensity_step_jitter: 1.0
